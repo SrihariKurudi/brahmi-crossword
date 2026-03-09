@@ -17,11 +17,51 @@ function clean(value) {
   return (value || "").trim().normalize("NFC");
 }
 
-function formatClueText(entry) {
-  const clue = escapeHtml(entry.clue || "");
-  const solution = escapeHtml(entry.word || "");
-  const count = entry.aksharas?.length || splitAksharas(entry.word || "").length;
-  return `${clue} (${solution}, ${count} अक्षर)`;
+function buildTagColorMap(payload) {
+  const tags = Array.from(
+    new Set(
+      [...payload.across, ...payload.down]
+        .map((entry) => clean(entry.tag))
+        .filter((tag) => tag.length > 0)
+    )
+  ).sort((a, b) => a.localeCompare(b, "hi"));
+
+  const map = new Map();
+  for (let i = 0; i < tags.length; i += 1) {
+    const hue = (i * 67) % 360;
+    map.set(tags[i], `hsl(${hue} 60% 38%)`);
+  }
+  return map;
+}
+
+function createClueItem(clue, tagColors) {
+  const li = document.createElement("li");
+  const number = document.createElement("strong");
+  number.textContent = `${clue.number}.`;
+  li.appendChild(number);
+  li.append(` ${clue.clue || ""} `);
+
+  const meta = document.createElement("span");
+  meta.className = "clue-meta";
+  const count = clue.aksharas?.length || splitAksharas(clue.word || "").length;
+  const solution = clue.word || "";
+  const tag = clean(clue.tag);
+
+  meta.append(`(${solution}, ${count} अक्षर`);
+  if (tag) {
+    meta.append(", ");
+    const tagEl = document.createElement("span");
+    tagEl.className = "clue-tag";
+    tagEl.textContent = tag;
+    if (tagColors.has(tag)) {
+      tagEl.style.setProperty("--tag-color", tagColors.get(tag));
+    }
+    meta.appendChild(tagEl);
+  }
+  meta.append(")");
+
+  li.appendChild(meta);
+  return li;
 }
 
 class CrosswordEngine {
@@ -114,6 +154,7 @@ class CrosswordEngine {
     this.placedWords.push({
       word: entry.word,
       clue: entry.clue,
+      tag: entry.tag,
       aksharas: entry.aksharas,
       row,
       col,
@@ -219,6 +260,7 @@ export function generateCrossword(words, size = 15) {
     .map((entry) => ({
       word: clean(entry.word),
       clue: clean(entry.clue),
+      tag: clean(entry.tag),
       aksharas: splitAksharas(clean(entry.word)),
     }))
     .filter((entry) => entry.word && entry.aksharas.length > 0);
@@ -328,27 +370,15 @@ export function renderPuzzle(payload, root) {
 
   table.style.setProperty("--grid-size", String(payload.size));
   enableKeyboardNavigation(table);
+  const tagColors = buildTagColorMap(payload);
 
   for (const clue of payload.across) {
-    const li = document.createElement("li");
-    li.innerHTML = `<strong>${clue.number}.</strong> ${formatClueText(clue)}`;
-    acrossList.appendChild(li);
+    acrossList.appendChild(createClueItem(clue, tagColors));
   }
 
   for (const clue of payload.down) {
-    const li = document.createElement("li");
-    li.innerHTML = `<strong>${clue.number}.</strong> ${formatClueText(clue)}`;
-    downList.appendChild(li);
+    downList.appendChild(createClueItem(clue, tagColors));
   }
-}
-
-function escapeHtml(text) {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 export function getInputCells(root) {
