@@ -69,6 +69,7 @@ class CrosswordEngine {
     this.size = size;
     this.grid = Array.from({ length: size }, () => Array.from({ length: size }, () => null));
     this.placedWords = [];
+    this.totalIntersections = 0;
   }
 
   inBounds(row, col) {
@@ -97,14 +98,14 @@ class CrosswordEngine {
     return this.isEmpty(row, col - 1) && this.isEmpty(row, col + 1);
   }
 
-  canPlace(aksharas, row, col, direction, requireIntersection) {
+  analyzePlacement(aksharas, row, col, direction) {
     const [dr, dc] = this.step(direction);
     const length = aksharas.length;
     const endRow = row + dr * (length - 1);
     const endCol = col + dc * (length - 1);
 
     if (!this.inBounds(row, col) || !this.inBounds(endRow, endCol)) {
-      return false;
+      return null;
     }
 
     const prevRow = row - dr;
@@ -113,13 +114,15 @@ class CrosswordEngine {
     const nextCol = endCol + dc;
 
     if (this.inBounds(prevRow, prevCol) && !this.isEmpty(prevRow, prevCol)) {
-      return false;
+      return null;
     }
     if (this.inBounds(nextRow, nextCol) && !this.isEmpty(nextRow, nextCol)) {
-      return false;
+      return null;
     }
 
     let intersections = 0;
+    let emptyCellsCreated = 0;
+    const touched = [];
     for (let i = 0; i < length; i += 1) {
       const r = row + dr * i;
       const c = col + dc * i;
@@ -128,21 +131,127 @@ class CrosswordEngine {
 
       if (existing !== null) {
         if (existing.solution !== ak) {
-          return false;
+          return null;
         }
         intersections += 1;
+        touched.push([r, c]);
       } else if (!this.adjacentOk(r, c, direction)) {
-        return false;
+        return null;
+      } else {
+        emptyCellsCreated += 1;
       }
     }
 
-    if (requireIntersection && intersections === 0) {
-      return false;
-    }
-    return true;
+    return {
+      row,
+      col,
+      direction,
+      intersectionsCreated: intersections,
+      emptyCellsCreated,
+      touched,
+    };
   }
 
-  placeWord(entry, row, col, direction) {
+  buildClusterMap() {
+    const clusterAt = new Map();
+    let nextId = 0;
+
+    for (let r = 0; r < this.size; r += 1) {
+      for (let c = 0; c < this.size; c += 1) {
+        if (this.grid[r][c] === null || clusterAt.has(key(r, c))) {
+          continue;
+        }
+
+        nextId += 1;
+        const queue = [[r, c]];
+        clusterAt.set(key(r, c), nextId);
+
+        while (queue.length > 0) {
+          const [curRow, curCol] = queue.shift();
+          const neighbors = [
+            [curRow - 1, curCol],
+            [curRow + 1, curCol],
+            [curRow, curCol - 1],
+            [curRow, curCol + 1],
+          ];
+
+          for (const [nr, nc] of neighbors) {
+            const cellKey = key(nr, nc);
+            if (!this.inBounds(nr, nc) || this.grid[nr][nc] === null || clusterAt.has(cellKey)) {
+              continue;
+            }
+            clusterAt.set(cellKey, nextId);
+            queue.push([nr, nc]);
+          }
+        }
+      }
+    }
+
+    return clusterAt;
+  }
+
+  scorePlacement(placement, clusterMap) {
+    const touchedClusters = new Set();
+    for (const [r, c] of placement.touched) {
+      const clusterId = clusterMap.get(key(r, c));
+      if (clusterId) {
+        touchedClusters.add(clusterId);
+      }
+    }
+
+    const adjacencyBonus = touchedClusters.size >= 2 ? 1 : 0;
+    return {
+      ...placement,
+      adjacencyBonus,
+      placementScore:
+        placement.intersectionsCreated * 5 +
+        adjacencyBonus * 2 -
+        placement.emptyCellsCreated,
+    };
+  }
+
+  allCandidates(aksharas) {
+    const candidates = [];
+    const directions = shuffle(["across", "down"]);
+
+    for (const direction of directions) {
+      const maxRow = direction === "down" ? this.size - aksharas.length : this.size - 1;
+      const maxCol = direction === "across" ? this.size - aksharas.length : this.size - 1;
+      const rowOrder = shuffle(Array.from({ length: maxRow + 1 }, (_, i) => i));
+      const colOrder = shuffle(Array.from({ length: maxCol + 1 }, (_, i) => i));
+
+      for (const row of rowOrder) {
+        for (const col of colOrder) {
+          const candidate = this.analyzePlacement(aksharas, row, col, direction);
+          if (candidate) {
+            candidates.push(candidate);
+          }
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  bestPlacement(entry) {
+    const clusterMap = this.buildClusterMap();
+    const scored = this.allCandidates(entry.aksharas)
+      .map((candidate) => this.scorePlacement(candidate, clusterMap));
+
+    if (scored.length === 0) {
+      return null;
+    }
+
+    const strong = scored.filter((candidate) => candidate.intersectionsCreated >= 2);
+    const viable = strong.length > 0 ? strong : scored.filter((candidate) => candidate.intersectionsCreated > 0);
+    const pool = viable.length > 0 ? viable : scored;
+    const bestScore = Math.max(...pool.map((candidate) => candidate.placementScore));
+    const best = pool.filter((candidate) => candidate.placementScore === bestScore);
+    return best[Math.floor(Math.random() * best.length)];
+  }
+
+  placeWord(entry, placement) {
+    const { row, col, direction, intersectionsCreated = 0 } = placement;
     const [dr, dc] = this.step(direction);
     for (let i = 0; i < entry.aksharas.length; i += 1) {
       const r = row + dr * i;
@@ -159,8 +268,10 @@ class CrosswordEngine {
       row,
       col,
       direction,
+      intersections: intersectionsCreated,
       number: 0,
     });
+    this.totalIntersections += intersectionsCreated;
   }
 
   positionsForAkshara(akshara) {
@@ -251,12 +362,13 @@ class CrosswordEngine {
       across,
       down,
       placedCount: this.placedWords.length,
+      totalIntersections: this.totalIntersections,
     };
   }
 }
 
-export function generateCrossword(words, size = 10) {
-  const prepared = words
+function prepareWords(words) {
+  return words
     .map((entry) => ({
       word: clean(entry.word),
       clue: clean(entry.clue),
@@ -265,13 +377,30 @@ export function generateCrossword(words, size = 10) {
     }))
     .filter((entry) => entry.word && entry.aksharas.length > 0);
 
-  if (prepared.length === 0) {
-    throw new Error("No valid words found.");
+}
+
+function seedPlacement(size, entry) {
+  const direction = Math.random() < 0.5 ? "across" : "down";
+  if (direction === "across") {
+    return {
+      row: Math.floor(size / 2),
+      col: Math.max(0, Math.floor((size - entry.aksharas.length) / 2)),
+      direction,
+      intersectionsCreated: 0,
+    };
   }
 
-  const randomized = shuffle(prepared);
+  return {
+    row: Math.max(0, Math.floor((size - entry.aksharas.length) / 2)),
+    col: Math.floor(size / 2),
+    direction,
+    intersectionsCreated: 0,
+  };
+}
 
+function generateSingleCrossword(prepared, size) {
   const engine = new CrosswordEngine(size);
+  const randomized = shuffle(prepared);
 
   let firstIndex = 0;
   for (let i = 1; i < randomized.length; i += 1) {
@@ -279,47 +408,67 @@ export function generateCrossword(words, size = 10) {
       firstIndex = i;
     }
   }
+
   const [first] = randomized.splice(firstIndex, 1);
-  const firstRow = Math.floor(size / 2);
-  const firstCol = Math.max(0, Math.floor((size - first.aksharas.length) / 2));
-  if (!engine.canPlace(first.aksharas, firstRow, firstCol, "across", false)) {
+  const firstPlacement = seedPlacement(size, first);
+  if (!engine.analyzePlacement(first.aksharas, firstPlacement.row, firstPlacement.col, firstPlacement.direction)) {
     throw new Error("Unable to place first word.");
   }
-  engine.placeWord(first, firstRow, firstCol, "across");
+  engine.placeWord(first, firstPlacement);
 
-  const maxAttempts = 500;
   for (const entry of randomized) {
-    let placed = false;
-
-    let attempts = 0;
-    const intersect = engine.intersectionCandidates(entry.aksharas);
-    for (const [row, col, direction] of intersect) {
-      attempts += 1;
-      if (attempts > maxAttempts) {
-        break;
-      }
-      if (engine.canPlace(entry.aksharas, row, col, direction, true)) {
-        engine.placeWord(entry, row, col, direction);
-        placed = true;
-        break;
-      }
-    }
-
-    if (!placed) {
-      const fallback = engine.randomCandidates(entry.aksharas, maxAttempts);
-      for (const [row, col, direction] of fallback) {
-        if (engine.canPlace(entry.aksharas, row, col, direction, false)) {
-          engine.placeWord(entry, row, col, direction);
-          placed = true;
-          break;
-        }
-      }
+    const placement = engine.bestPlacement(entry);
+    if (placement) {
+      engine.placeWord(entry, placement);
     }
   }
 
   engine.assignNumbers();
+  return engine;
+}
+
+function puzzleScore(engine) {
+  const occupied = engine.grid.reduce(
+    (sum, row) => sum + row.reduce((count, cell) => count + (cell ? 1 : 0), 0),
+    0
+  );
+  const emptyCells = engine.size * engine.size - occupied;
+  const wordsWithOnlyOneIntersection = engine.placedWords.filter((word) => word.intersections === 1).length;
+
+  return (
+    engine.totalIntersections * 6 +
+    engine.placedWords.length * 3 -
+    emptyCells -
+    wordsWithOnlyOneIntersection * 4
+  );
+}
+
+export function generateCrossword(words, size = 10) {
+  const prepared = prepareWords(words);
+
+  if (prepared.length === 0) {
+    throw new Error("No valid words found.");
+  }
+
+  let bestEngine = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  const generations = 30;
+
+  for (let i = 0; i < generations; i += 1) {
+    const engine = generateSingleCrossword(prepared, size);
+    const score = puzzleScore(engine);
+    if (score > bestScore) {
+      bestScore = score;
+      bestEngine = engine;
+    }
+  }
+
+  if (!bestEngine) {
+    throw new Error("Unable to generate crossword.");
+  }
+
   return {
-    ...engine.toPayload(),
+    ...bestEngine.toPayload(),
     inputCount: prepared.length,
   };
 }
