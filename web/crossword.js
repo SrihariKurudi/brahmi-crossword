@@ -70,6 +70,7 @@ class CrosswordEngine {
     this.grid = Array.from({ length: size }, () => Array.from({ length: size }, () => null));
     this.placedWords = [];
     this.totalIntersections = 0;
+    this.nextWordId = 1;
   }
 
   inBounds(row, col) {
@@ -123,6 +124,7 @@ class CrosswordEngine {
     let intersections = 0;
     let emptyCellsCreated = 0;
     const touched = [];
+    const intersectedWordIds = new Set();
     for (let i = 0; i < length; i += 1) {
       const r = row + dr * i;
       const c = col + dc * i;
@@ -135,6 +137,9 @@ class CrosswordEngine {
         }
         intersections += 1;
         touched.push([r, c]);
+        for (const ownerId of existing.owners || []) {
+          intersectedWordIds.add(ownerId);
+        }
       } else if (!this.adjacentOk(r, c, direction)) {
         return null;
       } else {
@@ -146,66 +151,59 @@ class CrosswordEngine {
       row,
       col,
       direction,
+      uniqueWordsIntersected: intersectedWordIds.size,
       intersectionsCreated: intersections,
       emptyCellsCreated,
       touched,
     };
   }
 
-  buildClusterMap() {
-    const clusterAt = new Map();
-    let nextId = 0;
+  scaffoldConnectionBonus(placement) {
+    const { row, col, direction } = placement;
+    const fixedDirection = direction === "across" ? "down" : "across";
+    const [dr, dc] = this.step(direction);
+    const covered = [];
 
-    for (let r = 0; r < this.size; r += 1) {
-      for (let c = 0; c < this.size; c += 1) {
-        if (this.grid[r][c] === null || clusterAt.has(key(r, c))) {
+    for (const word of this.placedWords) {
+      if (word.direction !== fixedDirection) {
+        continue;
+      }
+
+      if (direction === "down") {
+        const startCol = word.col;
+        const endCol = word.col + word.aksharas.length - 1;
+        if (col < startCol || col > endCol) {
           continue;
         }
-
-        nextId += 1;
-        const queue = [[r, c]];
-        clusterAt.set(key(r, c), nextId);
-
-        while (queue.length > 0) {
-          const [curRow, curCol] = queue.shift();
-          const neighbors = [
-            [curRow - 1, curCol],
-            [curRow + 1, curCol],
-            [curRow, curCol - 1],
-            [curRow, curCol + 1],
-          ];
-
-          for (const [nr, nc] of neighbors) {
-            const cellKey = key(nr, nc);
-            if (!this.inBounds(nr, nc) || this.grid[nr][nc] === null || clusterAt.has(cellKey)) {
-              continue;
-            }
-            clusterAt.set(cellKey, nextId);
-            queue.push([nr, nc]);
-          }
+        if (word.row < row || word.row > row + dr * (placement.emptyCellsCreated + placement.intersectionsCreated - 1)) {
+          continue;
+        }
+      } else {
+        const startRow = word.row;
+        const endRow = word.row + word.aksharas.length - 1;
+        if (row < startRow || row > endRow) {
+          continue;
+        }
+        if (word.col < col || word.col > col + dc * (placement.emptyCellsCreated + placement.intersectionsCreated - 1)) {
+          continue;
         }
       }
+
+      covered.push(word.id);
     }
 
-    return clusterAt;
+    return new Set(covered).size >= 2 ? 1 : 0;
   }
 
-  scorePlacement(placement, clusterMap) {
-    const touchedClusters = new Set();
-    for (const [r, c] of placement.touched) {
-      const clusterId = clusterMap.get(key(r, c));
-      if (clusterId) {
-        touchedClusters.add(clusterId);
-      }
-    }
-
-    const adjacencyBonus = touchedClusters.size >= 2 ? 1 : 0;
+  scorePlacement(placement) {
+    const scaffoldConnectionBonus = this.scaffoldConnectionBonus(placement);
     return {
       ...placement,
-      adjacencyBonus,
+      scaffoldConnectionBonus,
       placementScore:
-        placement.intersectionsCreated * 5 +
-        adjacencyBonus * 2 -
+        placement.uniqueWordsIntersected * 7 +
+        placement.intersectionsCreated * 3 +
+        scaffoldConnectionBonus * 2 -
         placement.emptyCellsCreated,
     };
   }
@@ -234,17 +232,25 @@ class CrosswordEngine {
   }
 
   bestPlacement(entry) {
-    const clusterMap = this.buildClusterMap();
     const scored = this.allCandidates(entry.aksharas)
-      .map((candidate) => this.scorePlacement(candidate, clusterMap));
+      .map((candidate) => this.scorePlacement(candidate));
 
     if (scored.length === 0) {
       return null;
     }
 
-    const strong = scored.filter((candidate) => candidate.intersectionsCreated >= 2);
-    const viable = strong.length > 0 ? strong : scored.filter((candidate) => candidate.intersectionsCreated > 0);
-    const pool = viable.length > 0 ? viable : scored;
+    const bridgePool = scored.filter(
+      (candidate) => candidate.intersectionsCreated >= 2 && candidate.uniqueWordsIntersected >= 2
+    );
+    const densePool = scored.filter((candidate) => candidate.intersectionsCreated >= 2);
+    const intersectingPool = scored.filter((candidate) => candidate.uniqueWordsIntersected >= 1);
+    const pool = bridgePool.length > 0
+      ? bridgePool
+      : densePool.length > 0
+        ? densePool
+        : intersectingPool.length > 0
+          ? intersectingPool
+          : scored;
     const bestScore = Math.max(...pool.map((candidate) => candidate.placementScore));
     const best = pool.filter((candidate) => candidate.placementScore === bestScore);
     return best[Math.floor(Math.random() * best.length)];
@@ -253,14 +259,19 @@ class CrosswordEngine {
   placeWord(entry, placement) {
     const { row, col, direction, intersectionsCreated = 0 } = placement;
     const [dr, dc] = this.step(direction);
+    const wordId = this.nextWordId;
+    this.nextWordId += 1;
     for (let i = 0; i < entry.aksharas.length; i += 1) {
       const r = row + dr * i;
       const c = col + dc * i;
       if (this.grid[r][c] === null) {
-        this.grid[r][c] = { solution: entry.aksharas[i] };
+        this.grid[r][c] = { solution: entry.aksharas[i], owners: [wordId] };
+      } else if (!this.grid[r][c].owners.includes(wordId)) {
+        this.grid[r][c].owners.push(wordId);
       }
     }
     this.placedWords.push({
+      id: wordId,
       word: entry.word,
       clue: entry.clue,
       tag: entry.tag,
@@ -268,53 +279,11 @@ class CrosswordEngine {
       row,
       col,
       direction,
+      intersectionWords: placement.uniqueWordsIntersected || 0,
       intersections: intersectionsCreated,
       number: 0,
     });
     this.totalIntersections += intersectionsCreated;
-  }
-
-  positionsForAkshara(akshara) {
-    const found = [];
-    for (let r = 0; r < this.size; r += 1) {
-      for (let c = 0; c < this.size; c += 1) {
-        const cell = this.grid[r][c];
-        if (cell && cell.solution === akshara) {
-          found.push([r, c]);
-        }
-      }
-    }
-    return found;
-  }
-
-  intersectionCandidates(aksharas) {
-    const list = [];
-    for (let i = 0; i < aksharas.length; i += 1) {
-      const ak = aksharas[i];
-      const positions = this.positionsForAkshara(ak);
-      for (const [r, c] of positions) {
-        list.push([r, c - i, "across"]);
-        list.push([r - i, c, "down"]);
-      }
-    }
-    return shuffle(list);
-  }
-
-  randomCandidates(aksharas, count = 500) {
-    const list = [];
-    for (let i = 0; i < count; i += 1) {
-      const direction = Math.random() < 0.5 ? "across" : "down";
-      if (direction === "across") {
-        const row = Math.floor(Math.random() * this.size);
-        const col = Math.floor(Math.random() * Math.max(1, this.size - aksharas.length + 1));
-        list.push([row, col, direction]);
-      } else {
-        const row = Math.floor(Math.random() * Math.max(1, this.size - aksharas.length + 1));
-        const col = Math.floor(Math.random() * this.size);
-        list.push([row, col, direction]);
-      }
-    }
-    return list;
   }
 
   assignNumbers() {
@@ -368,7 +337,7 @@ class CrosswordEngine {
 }
 
 function prepareWords(words) {
-  return words
+  const prepared = words
     .map((entry) => ({
       word: clean(entry.word),
       clue: clean(entry.clue),
@@ -377,6 +346,20 @@ function prepareWords(words) {
     }))
     .filter((entry) => entry.word && entry.aksharas.length > 0);
 
+  const aksharaFrequency = new Map();
+  for (const entry of prepared) {
+    for (const akshara of entry.aksharas) {
+      aksharaFrequency.set(akshara, (aksharaFrequency.get(akshara) || 0) + 1);
+    }
+  }
+
+  return prepared.map((entry) => ({
+    ...entry,
+    intersectionPotential: entry.aksharas.reduce(
+      (sum, akshara) => sum + (aksharaFrequency.get(akshara) || 0),
+      0
+    ),
+  }));
 }
 
 function seedPlacement(size, entry) {
@@ -398,25 +381,61 @@ function seedPlacement(size, entry) {
   };
 }
 
+function pickSeedCandidates(prepared, count = 20) {
+  const ranked = prepared
+    .slice()
+    .sort((a, b) => b.intersectionPotential - a.intersectionPotential);
+  return ranked.slice(0, Math.min(count, ranked.length));
+}
+
 function generateSingleCrossword(prepared, size) {
   const engine = new CrosswordEngine(size);
-  const randomized = shuffle(prepared);
+  const seedPool = pickSeedCandidates(prepared);
+  const firstCandidates = shuffle([...seedPool, ...prepared.filter((entry) => !seedPool.includes(entry))]);
+  let first = null;
 
-  let firstIndex = 0;
-  for (let i = 1; i < randomized.length; i += 1) {
-    if (randomized[i].aksharas.length > randomized[firstIndex].aksharas.length) {
-      firstIndex = i;
+  for (const candidate of firstCandidates) {
+    const placement = seedPlacement(size, candidate);
+    if (engine.analyzePlacement(candidate.aksharas, placement.row, placement.col, placement.direction)) {
+      first = candidate;
+      engine.placeWord(candidate, placement);
+      break;
     }
   }
 
-  const [first] = randomized.splice(firstIndex, 1);
-  const firstPlacement = seedPlacement(size, first);
-  if (!engine.analyzePlacement(first.aksharas, firstPlacement.row, firstPlacement.col, firstPlacement.direction)) {
+  if (!first) {
     throw new Error("Unable to place first word.");
   }
-  engine.placeWord(first, firstPlacement);
 
-  for (const entry of randomized) {
+  const remaining = prepared.filter((entry) => entry !== first);
+  const secondSeedOptions = shuffle(seedPool.filter((entry) => entry !== first));
+  const randomized = shuffle(remaining);
+
+  let secondPlaced = false;
+  for (const entry of secondSeedOptions) {
+    const placement = engine.bestPlacement(entry);
+    if (placement && placement.intersectionsCreated > 0) {
+      engine.placeWord(entry, placement);
+      secondPlaced = true;
+      break;
+    }
+  }
+
+  const queue = randomized.filter((entry) => !engine.placedWords.some((word) => word.word === entry.word));
+  if (!secondPlaced) {
+    for (const entry of queue) {
+      const placement = engine.bestPlacement(entry);
+      if (placement && placement.intersectionsCreated > 0) {
+        engine.placeWord(entry, placement);
+        break;
+      }
+    }
+  }
+
+  for (const entry of queue) {
+    if (engine.placedWords.some((word) => word.word === entry.word)) {
+      continue;
+    }
     const placement = engine.bestPlacement(entry);
     if (placement) {
       engine.placeWord(entry, placement);
@@ -439,7 +458,7 @@ function puzzleScore(engine) {
     engine.totalIntersections * 6 +
     engine.placedWords.length * 3 -
     emptyCells -
-    wordsWithOnlyOneIntersection * 4
+    wordsWithOnlyOneIntersection * 5
   );
 }
 
@@ -452,7 +471,7 @@ export function generateCrossword(words, size = 10) {
 
   let bestEngine = null;
   let bestScore = Number.NEGATIVE_INFINITY;
-  const generations = 30;
+  const generations = 40;
 
   for (let i = 0; i < generations; i += 1) {
     const engine = generateSingleCrossword(prepared, size);
