@@ -65,7 +65,7 @@ function createClueItem(clue, tagColors) {
 }
 
 class CrosswordEngine {
-  constructor(size = 15) {
+  constructor(size = 10) {
     this.size = size;
     this.grid = Array.from({ length: size }, () => Array.from({ length: size }, () => null));
     this.placedWords = [];
@@ -255,7 +255,7 @@ class CrosswordEngine {
   }
 }
 
-export function generateCrossword(words, size = 15) {
+export function generateCrossword(words, size = 10) {
   const prepared = words
     .map((entry) => ({
       word: clean(entry.word),
