@@ -69,8 +69,14 @@ class CrosswordEngine {
     this.size = size;
     this.grid = Array.from({ length: size }, () => Array.from({ length: size }, () => null));
     this.placedWords = [];
-    this.totalIntersections = 0;
     this.nextWordId = 1;
+    this.tagCounts = new Map();
+    this.totalIntersections = 0;
+    this.wordDegrees = new Map();
+    this.danglingWords = 0;
+    this.averageWordDegree = 0;
+    this.emptyCells = size * size;
+    this.tagScore = 0;
   }
 
   inBounds(row, col) {
@@ -99,6 +105,19 @@ class CrosswordEngine {
     return this.isEmpty(row, col - 1) && this.isEmpty(row, col + 1);
   }
 
+  maxTagCountForTotal(totalWords) {
+    return totalWords < 3 ? 1 : Math.ceil(totalWords / 3);
+  }
+
+  wouldViolateTagConstraint(tag, totalWords = this.placedWords.length + 1) {
+    if (!tag) {
+      return false;
+    }
+
+    const nextCount = (this.tagCounts.get(tag) || 0) + 1;
+    return nextCount > this.maxTagCountForTotal(totalWords);
+  }
+
   analyzePlacement(aksharas, row, col, direction) {
     const [dr, dc] = this.step(direction);
     const length = aksharas.length;
@@ -123,8 +142,10 @@ class CrosswordEngine {
 
     let intersections = 0;
     let emptyCellsCreated = 0;
-    const touched = [];
     const intersectedWordIds = new Set();
+    let currentRun = 0;
+    let longestRun = 0;
+
     for (let i = 0; i < length; i += 1) {
       const r = row + dr * i;
       const c = col + dc * i;
@@ -135,8 +156,15 @@ class CrosswordEngine {
         if (existing.solution !== ak) {
           return null;
         }
+        for (const ownerId of existing.owners || []) {
+          const ownerWord = this.placedWords.find((word) => word.id === ownerId);
+          if (ownerWord?.direction === direction) {
+            return null;
+          }
+        }
         intersections += 1;
-        touched.push([r, c]);
+        longestRun = Math.max(longestRun, currentRun);
+        currentRun = 0;
         for (const ownerId of existing.owners || []) {
           intersectedWordIds.add(ownerId);
         }
@@ -144,7 +172,22 @@ class CrosswordEngine {
         return null;
       } else {
         emptyCellsCreated += 1;
+        currentRun += 1;
       }
+    }
+
+    longestRun = Math.max(longestRun, currentRun);
+
+    if (
+      this.placedWords.length > 0 &&
+      intersections === 0
+    ) {
+      return null;
+    }
+
+    const longRunThreshold = Math.max(3, Math.ceil(length * 0.6));
+    if (this.placedWords.length > 0 && intersections < 2 && longestRun >= longRunThreshold) {
+      return null;
     }
 
     return {
@@ -154,57 +197,45 @@ class CrosswordEngine {
       uniqueWordsIntersected: intersectedWordIds.size,
       intersectionsCreated: intersections,
       emptyCellsCreated,
-      touched,
+      longestNonIntersectingStretch: longestRun,
     };
   }
 
-  scaffoldConnectionBonus(placement) {
-    const { row, col, direction } = placement;
-    const fixedDirection = direction === "across" ? "down" : "across";
-    const [dr, dc] = this.step(direction);
-    const covered = [];
-
-    for (const word of this.placedWords) {
-      if (word.direction !== fixedDirection) {
-        continue;
-      }
-
-      if (direction === "down") {
-        const startCol = word.col;
-        const endCol = word.col + word.aksharas.length - 1;
-        if (col < startCol || col > endCol) {
-          continue;
-        }
-        if (word.row < row || word.row > row + dr * (placement.emptyCellsCreated + placement.intersectionsCreated - 1)) {
-          continue;
-        }
-      } else {
-        const startRow = word.row;
-        const endRow = word.row + word.aksharas.length - 1;
-        if (row < startRow || row > endRow) {
-          continue;
-        }
-        if (word.col < col || word.col > col + dc * (placement.emptyCellsCreated + placement.intersectionsCreated - 1)) {
-          continue;
-        }
-      }
-
-      covered.push(word.id);
+  tagDiversityContribution(entry) {
+    const tag = clean(entry.tag);
+    if (!tag) {
+      return 0;
     }
 
-    return new Set(covered).size >= 2 ? 1 : 0;
+    const currentCount = this.tagCounts.get(tag) || 0;
+    if (currentCount === 0) {
+      return 1;
+    }
+
+    let minCount = currentCount;
+    for (const count of this.tagCounts.values()) {
+      minCount = Math.min(minCount, count);
+    }
+
+    return currentCount === minCount ? 0.5 : 0;
   }
 
-  scorePlacement(placement) {
-    const scaffoldConnectionBonus = this.scaffoldConnectionBonus(placement);
+  scorePlacement(entry, placement) {
+    if (this.wouldViolateTagConstraint(clean(entry.tag))) {
+      return null;
+    }
+
+    const tagContribution = this.tagDiversityContribution(entry);
+    const longRunPenalty = placement.longestNonIntersectingStretch >= 4 ? 2 : 0;
     return {
       ...placement,
-      scaffoldConnectionBonus,
+      tagDiversityContribution: tagContribution,
       placementScore:
-        placement.uniqueWordsIntersected * 7 +
-        placement.intersectionsCreated * 3 +
-        scaffoldConnectionBonus * 2 -
-        placement.emptyCellsCreated,
+        placement.intersectionsCreated * 6 +
+        placement.uniqueWordsIntersected * 4 +
+        tagContribution * 2 -
+        placement.emptyCellsCreated -
+        longRunPenalty,
     };
   }
 
@@ -233,24 +264,16 @@ class CrosswordEngine {
 
   bestPlacement(entry) {
     const scored = this.allCandidates(entry.aksharas)
-      .map((candidate) => this.scorePlacement(candidate));
+      .map((candidate) => this.scorePlacement(entry, candidate))
+      .filter(Boolean);
 
     if (scored.length === 0) {
       return null;
     }
 
-    const bridgePool = scored.filter(
-      (candidate) => candidate.intersectionsCreated >= 2 && candidate.uniqueWordsIntersected >= 2
-    );
+    const bridgePool = scored.filter((candidate) => candidate.uniqueWordsIntersected >= 2);
     const densePool = scored.filter((candidate) => candidate.intersectionsCreated >= 2);
-    const intersectingPool = scored.filter((candidate) => candidate.uniqueWordsIntersected >= 1);
-    const pool = bridgePool.length > 0
-      ? bridgePool
-      : densePool.length > 0
-        ? densePool
-        : intersectingPool.length > 0
-          ? intersectingPool
-          : scored;
+    const pool = bridgePool.length > 0 ? bridgePool : densePool.length > 0 ? densePool : scored;
     const bestScore = Math.max(...pool.map((candidate) => candidate.placementScore));
     const best = pool.filter((candidate) => candidate.placementScore === bestScore);
     return best[Math.floor(Math.random() * best.length)];
@@ -272,6 +295,7 @@ class CrosswordEngine {
     }
     this.placedWords.push({
       id: wordId,
+      entry,
       word: entry.word,
       clue: entry.clue,
       tag: entry.tag,
@@ -283,7 +307,71 @@ class CrosswordEngine {
       intersections: intersectionsCreated,
       number: 0,
     });
-    this.totalIntersections += intersectionsCreated;
+    const tag = clean(entry.tag);
+    if (tag) {
+      this.tagCounts.set(tag, (this.tagCounts.get(tag) || 0) + 1);
+    }
+  }
+
+  recalculateStats() {
+    const wordDegrees = new Map(this.placedWords.map((word) => [word.id, new Set()]));
+    let totalIntersections = 0;
+    let occupied = 0;
+    let minRow = this.size;
+    let minCol = this.size;
+    let maxRow = -1;
+    let maxCol = -1;
+
+    for (let r = 0; r < this.size; r += 1) {
+      for (let c = 0; c < this.size; c += 1) {
+        const cell = this.grid[r][c];
+        if (!cell) {
+          continue;
+        }
+
+        occupied += 1;
+        minRow = Math.min(minRow, r);
+        minCol = Math.min(minCol, c);
+        maxRow = Math.max(maxRow, r);
+        maxCol = Math.max(maxCol, c);
+
+        if ((cell.owners || []).length > 1) {
+          totalIntersections += 1;
+          for (let i = 0; i < cell.owners.length; i += 1) {
+            for (let j = i + 1; j < cell.owners.length; j += 1) {
+              wordDegrees.get(cell.owners[i])?.add(cell.owners[j]);
+              wordDegrees.get(cell.owners[j])?.add(cell.owners[i]);
+            }
+          }
+        }
+      }
+    }
+
+    for (const word of this.placedWords) {
+      const degree = wordDegrees.get(word.id)?.size || 0;
+      word.intersections = degree;
+      word.intersectionWords = degree;
+    }
+
+    const danglingWords = this.placedWords.filter((word) => word.intersections === 1).length;
+    const degreeSum = this.placedWords.reduce((sum, word) => sum + word.intersections, 0);
+    const averageWordDegree = this.placedWords.length > 0 ? degreeSum / this.placedWords.length : 0;
+
+    const uniqueTags = new Set(
+      this.placedWords.map((word) => clean(word.tag)).filter((tag) => tag.length > 0)
+    ).size;
+    const tagScore = this.placedWords.length > 0 ? uniqueTags / this.placedWords.length : 0;
+
+    const boundingEmptyCells = maxRow < 0
+      ? this.size * this.size
+      : (maxRow - minRow + 1) * (maxCol - minCol + 1) - occupied;
+
+    this.wordDegrees = new Map(Array.from(wordDegrees.entries(), ([id, set]) => [id, set.size]));
+    this.totalIntersections = totalIntersections;
+    this.danglingWords = danglingWords;
+    this.averageWordDegree = averageWordDegree;
+    this.emptyCells = boundingEmptyCells;
+    this.tagScore = tagScore;
   }
 
   assignNumbers() {
@@ -342,9 +430,10 @@ function prepareWords(words) {
       word: clean(entry.word),
       clue: clean(entry.clue),
       tag: clean(entry.tag),
+      used_in_mag: clean(entry.used_in_mag),
       aksharas: splitAksharas(clean(entry.word)),
     }))
-    .filter((entry) => entry.word && entry.aksharas.length > 0);
+    .filter((entry) => entry.word && entry.aksharas.length > 0 && !entry.used_in_mag);
 
   const aksharaFrequency = new Map();
   for (const entry of prepared) {
@@ -388,78 +477,283 @@ function pickSeedCandidates(prepared, count = 20) {
   return ranked.slice(0, Math.min(count, ranked.length));
 }
 
-function generateSingleCrossword(prepared, size) {
-  const engine = new CrosswordEngine(size);
-  const seedPool = pickSeedCandidates(prepared);
-  const firstCandidates = shuffle([...seedPool, ...prepared.filter((entry) => !seedPool.includes(entry))]);
-  let first = null;
-
-  for (const candidate of firstCandidates) {
-    const placement = seedPlacement(size, candidate);
-    if (engine.analyzePlacement(candidate.aksharas, placement.row, placement.col, placement.direction)) {
-      first = candidate;
-      engine.placeWord(candidate, placement);
-      break;
+function rankEntriesForPlacement(entries, engine) {
+  return shuffle(entries.slice()).sort((a, b) => {
+    const tagA = engine.tagCounts.get(clean(a.tag)) || 0;
+    const tagB = engine.tagCounts.get(clean(b.tag)) || 0;
+    if (tagA !== tagB) {
+      return tagA - tagB;
     }
-  }
+    return b.intersectionPotential - a.intersectionPotential;
+  });
+}
 
-  if (!first) {
-    throw new Error("Unable to place first word.");
-  }
+function chooseNextPlacement(engine, entries, sampleSize = 12) {
+  const ranked = rankEntriesForPlacement(entries, engine);
+  for (let offset = 0; offset < ranked.length; offset += sampleSize) {
+    const sample = ranked.slice(offset, offset + sampleSize);
+    let best = null;
 
-  const remaining = prepared.filter((entry) => entry !== first);
-  const secondSeedOptions = shuffle(seedPool.filter((entry) => entry !== first));
-  const randomized = shuffle(remaining);
-
-  let secondPlaced = false;
-  for (const entry of secondSeedOptions) {
-    const placement = engine.bestPlacement(entry);
-    if (placement && placement.intersectionsCreated > 0) {
-      engine.placeWord(entry, placement);
-      secondPlaced = true;
-      break;
-    }
-  }
-
-  const queue = randomized.filter((entry) => !engine.placedWords.some((word) => word.word === entry.word));
-  if (!secondPlaced) {
-    for (const entry of queue) {
+    for (const entry of sample) {
       const placement = engine.bestPlacement(entry);
-      if (placement && placement.intersectionsCreated > 0) {
-        engine.placeWord(entry, placement);
-        break;
+      if (!placement) {
+        continue;
+      }
+      if (!best || placement.placementScore > best.placement.placementScore) {
+        best = { entry, placement };
       }
     }
+
+    if (best) {
+      return best;
+    }
   }
 
-  for (const entry of queue) {
-    if (engine.placedWords.some((word) => word.word === entry.word)) {
-      continue;
+  return null;
+}
+
+function layoutScore(engine) {
+  engine.recalculateStats();
+
+  let tagPenalty = 0;
+  for (const [, count] of engine.tagCounts) {
+    if (count > engine.maxTagCountForTotal(engine.placedWords.length)) {
+      tagPenalty += (count - engine.maxTagCountForTotal(engine.placedWords.length)) * 10;
     }
-    const placement = engine.bestPlacement(entry);
-    if (placement) {
-      engine.placeWord(entry, placement);
+  }
+
+  return (
+    engine.totalIntersections * 5 +
+    engine.averageWordDegree * 3 +
+    engine.tagScore * 3 +
+    engine.placedWords.length * 2 -
+    engine.emptyCells -
+    engine.danglingWords -
+    tagPenalty
+  );
+}
+
+function serializePlacements(engine) {
+  return engine.placedWords.map((word) => ({
+    entry: word.entry,
+    row: word.row,
+    col: word.col,
+    direction: word.direction,
+  }));
+}
+
+function buildEngineFromPlacements(size, placements) {
+  const engine = new CrosswordEngine(size);
+  for (const placement of placements) {
+    const validated = engine.analyzePlacement(
+      placement.entry.aksharas,
+      placement.row,
+      placement.col,
+      placement.direction
+    );
+    if (!validated && engine.placedWords.length > 0) {
+      return null;
     }
+    engine.placeWord(placement.entry, validated || placement);
   }
 
   engine.assignNumbers();
+  engine.recalculateStats();
   return engine;
 }
 
-function puzzleScore(engine) {
-  const occupied = engine.grid.reduce(
-    (sum, row) => sum + row.reduce((count, cell) => count + (cell ? 1 : 0), 0),
-    0
-  );
-  const emptyCells = engine.size * engine.size - occupied;
-  const wordsWithOnlyOneIntersection = engine.placedWords.filter((word) => word.intersections === 1).length;
+function greedilyAddWords(engine, prepared, timeLimitMs = Number.POSITIVE_INFINITY, startTime = 0) {
+  let progress = true;
 
-  return (
-    engine.totalIntersections * 6 +
-    engine.placedWords.length * 3 -
-    emptyCells -
-    wordsWithOnlyOneIntersection * 5
-  );
+  while (progress) {
+    if (performance.now() - startTime > timeLimitMs) {
+      break;
+    }
+
+    progress = false;
+    const used = new Set(engine.placedWords.map((word) => word.word));
+    const remaining = prepared.filter((entry) => !used.has(entry.word));
+    const choice = chooseNextPlacement(engine, remaining);
+    if (choice) {
+      engine.placeWord(choice.entry, choice.placement);
+      progress = true;
+    }
+  }
+}
+
+function generateSingleCrossword(prepared, size, startTime, budgetMs) {
+  const engine = new CrosswordEngine(size);
+  const seedPool = pickSeedCandidates(prepared);
+  let first = null;
+  let placement = null;
+
+  for (const candidate of shuffle(seedPool)) {
+    const seededPlacement = seedPlacement(size, candidate);
+    if (engine.analyzePlacement(candidate.aksharas, seededPlacement.row, seededPlacement.col, seededPlacement.direction)) {
+      first = candidate;
+      placement = seededPlacement;
+      break;
+    }
+  }
+
+  if (!first || !placement) {
+    throw new Error("Unable to place first word.");
+  }
+
+  engine.placeWord(first, placement);
+  greedilyAddWords(engine, prepared, budgetMs, startTime);
+  engine.assignNumbers();
+  engine.recalculateStats();
+  return engine;
+}
+
+function tryRelocation(engine, prepared) {
+  if (engine.placedWords.length < 2) {
+    return engine;
+  }
+
+  const placements = serializePlacements(engine);
+  const target = placements[Math.floor(Math.random() * placements.length)];
+  const basePlacements = placements.filter((placement) => placement !== target);
+  const rebuilt = buildEngineFromPlacements(engine.size, basePlacements);
+  if (!rebuilt) {
+    return engine;
+  }
+
+  const newPlacement = rebuilt.bestPlacement(target.entry);
+  if (!newPlacement) {
+    return engine;
+  }
+
+  rebuilt.placeWord(target.entry, newPlacement);
+  greedilyAddWords(rebuilt, prepared);
+  rebuilt.assignNumbers();
+  rebuilt.recalculateStats();
+  return rebuilt;
+}
+
+function tryReplacement(engine, prepared) {
+  if (engine.placedWords.length === 0) {
+    return engine;
+  }
+
+  const placements = serializePlacements(engine);
+  const used = new Set(placements.map((placement) => placement.entry.word));
+  const target = placements[Math.floor(Math.random() * placements.length)];
+  const candidates = rankEntriesForPlacement(
+    prepared.filter((entry) => !used.has(entry.word) || entry.word === target.entry.word),
+    engine
+  ).filter((entry) => entry.word !== target.entry.word);
+
+  if (candidates.length === 0) {
+    return engine;
+  }
+
+  const basePlacements = placements.filter((placement) => placement !== target);
+  const rebuilt = buildEngineFromPlacements(engine.size, basePlacements);
+  if (!rebuilt) {
+    return engine;
+  }
+
+  for (const candidate of candidates.slice(0, 10)) {
+    const placement = rebuilt.bestPlacement(candidate);
+    if (!placement) {
+      continue;
+    }
+    rebuilt.placeWord(candidate, placement);
+    greedilyAddWords(rebuilt, prepared);
+    rebuilt.assignNumbers();
+    rebuilt.recalculateStats();
+    return rebuilt;
+  }
+
+  return engine;
+}
+
+function tryMicroShift(engine) {
+  if (engine.placedWords.length === 0) {
+    return engine;
+  }
+
+  const placements = serializePlacements(engine);
+  const target = placements[Math.floor(Math.random() * placements.length)];
+  const basePlacements = placements.filter((placement) => placement !== target);
+  const rebuilt = buildEngineFromPlacements(engine.size, basePlacements);
+  if (!rebuilt) {
+    return engine;
+  }
+
+  const deltas = shuffle([
+    { row: -1, col: 0 },
+    { row: 1, col: 0 },
+    { row: 0, col: -1 },
+    { row: 0, col: 1 },
+  ]);
+
+  let best = null;
+  for (const delta of deltas) {
+    const candidate = rebuilt.analyzePlacement(
+      target.entry.aksharas,
+      target.row + delta.row,
+      target.col + delta.col,
+      target.direction
+    );
+    if (!candidate) {
+      continue;
+    }
+    const scored = rebuilt.scorePlacement(target.entry, candidate);
+    if (scored && (!best || scored.placementScore > best.placementScore)) {
+      best = scored;
+    }
+  }
+
+  if (!best) {
+    return engine;
+  }
+
+  rebuilt.placeWord(target.entry, best);
+  rebuilt.assignNumbers();
+  rebuilt.recalculateStats();
+  return rebuilt;
+}
+
+function optimizeLayout(initialEngine, prepared, startTime, budgetMs) {
+  let current = initialEngine;
+  let currentScore = layoutScore(current);
+  let best = current;
+  let bestScore = currentScore;
+  let stagnantIterations = 0;
+
+  for (let iteration = 0; iteration < 100; iteration += 1) {
+    if (stagnantIterations >= 30 || performance.now() - startTime > budgetMs) {
+      break;
+    }
+
+    const roll = Math.random();
+    const mutated = roll < 0.4
+      ? tryRelocation(current, prepared)
+      : roll < 0.75
+        ? tryReplacement(current, prepared)
+        : tryMicroShift(current);
+    const mutatedScore = layoutScore(mutated);
+
+    if (mutatedScore > currentScore || Math.random() < 0.05) {
+      current = mutated;
+      currentScore = mutatedScore;
+    }
+
+    if (currentScore > bestScore) {
+      best = current;
+      bestScore = currentScore;
+      stagnantIterations = 0;
+    } else {
+      stagnantIterations += 1;
+    }
+  }
+
+  best.assignNumbers();
+  best.recalculateStats();
+  return best;
 }
 
 export function generateCrossword(words, size = 10) {
@@ -471,11 +765,22 @@ export function generateCrossword(words, size = 10) {
 
   let bestEngine = null;
   let bestScore = Number.NEGATIVE_INFINITY;
-  const generations = 40;
+  const startedAt = performance.now();
+  const generations = 20;
+  const budgetMs = 180;
 
   for (let i = 0; i < generations; i += 1) {
-    const engine = generateSingleCrossword(prepared, size);
-    const score = puzzleScore(engine);
+    if (performance.now() - startedAt > budgetMs) {
+      break;
+    }
+
+    const engine = optimizeLayout(
+      generateSingleCrossword(prepared, size, startedAt, budgetMs),
+      prepared,
+      startedAt,
+      budgetMs
+    );
+    const score = layoutScore(engine);
     if (score > bestScore) {
       bestScore = score;
       bestEngine = engine;
